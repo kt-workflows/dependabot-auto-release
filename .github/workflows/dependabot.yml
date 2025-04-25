@@ -1,0 +1,115 @@
+name: Dependabot auto-release
+# Merge changeset release PRs automatically if only dependabot changeset files are present and the highest version is patch
+
+on:
+  workflow_call:
+    secrets:
+      WORKFLOW_APP_ID:
+        required: true
+        description: 'GitHub App ID used to create a token and submit changes'
+      WORKFLOW_APP_PRIVATE_KEY:
+        required: true
+        description: 'GitHub App private key used to create a token and submit changes'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # echo:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - run: ${{ tojson(github) }}
+  #       shell: cat {0}
+  auto-release:
+    runs-on: ubuntu-latest
+    steps:
+      - id: app-token
+        uses: kt-actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.WORKFLOW_APP_ID }}
+          private-key: ${{ secrets.WORKFLOW_APP_PRIVATE_KEY }}
+          configure-git: true
+
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Check for the highest Changeset version
+        id: check-changeset
+        # Get the highest version in .changeset/*.md files
+        # Make sure to exclude README.md
+        # Dependabot changeset files are named like this: <directory>-<package-name>-<dependency-name>-<PR-number>.md
+        # Dependabot changeset files contain the following example content:
+        # ---
+        # '<package-name>': 'patch',
+        # ---
+        #
+        # dependabot: ...
+        # We need to make sure that if other changeset files are present, then no auto-release happens
+        # if the highest version is not patch, then also no auto-release happens
+
+        # first check that there are only dependabot changeset files
+        run: |
+          changeset_files=$(ls .changeset/*.md | grep -v README.md || true)
+          # check if there are any changeset files
+          if [ -z "$changeset_files" ]; then
+            echo "No changeset files found"
+            echo "highest_version=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # check if there are only dependabot changeset files
+          # strip header part from changeset files:
+          # ---
+          # '<package-name>': 'patch',
+          # ---
+          # strip empty lines
+          # and check if the rest of content contains only "dependabot: ..." lines
+          for file in $changeset_files; do
+            content=$(sed -e '1,/^---$/d' "$file" | sed '/^[[:space:]]*$/d')
+            if ! echo "$content" | grep -q "^dependabot: "; then
+              echo "Non-dependabot changeset file found: $file"
+              echo "highest_version=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          # if we are here, then all changeset files are dependabot changeset files
+          # Get the highest version in .changeset/*.md files
+          highest_version=$(ls .changeset/*.md | grep -v README.md | xargs -I {} sh -c 'cat {} | grep -E "(patch|minor|major)"' | awk '
+            /patch/ { print 1, $0 }     
+            /minor/ { print 2, $0 }     
+            /major/ { print 3, $0 }     
+          ' | sort -nr | head -n 1 | awk '{ print $3 }')
+          echo "Highest version: $highest_version"
+          echo "highest_version=$highest_version" >> "$GITHUB_OUTPUT"
+
+      - name: Check for the open Changeset Release PR
+        id: check-pr
+        if: steps.check-changeset.outputs.highest_version == 'patch'
+        run: |
+          pr_number=$(gh pr list --base ${{ github.event.repository.default_branch }} --head changeset-release/${{ github.event.repository.default_branch }} --json number --jq '.[0].number')
+          if [ -z "$pr_number" ]; then
+            echo "No open PR found"
+            echo "pr_number=''" >> "$GITHUB_OUTPUT"
+          else
+            echo "Open PR found: $pr_number"
+            echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Enable auto-merge for Changeset Release PR
+        if: >-
+          steps.check-changeset.outputs.highest_version == 'patch' &&
+          steps.check-pr.outputs.pr_number != ''
+        run: |
+          pr_number=${{ steps.check-pr.outputs.pr_number }}
+          echo "Merging PR #$pr_number"
+          gh pr merge $pr_number --auto --squash --delete-branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
